@@ -5,6 +5,7 @@
 // Licensed under the Apache License, Version 2.0
 
 import { BrownEventEmitter } from './event'
+import { isSwitchAssetType } from '../../../ssh/algorithms'
 import {
   remoteSshConnect,
   remoteSshExecStream,
@@ -498,11 +499,14 @@ export class RemoteTerminalProcess extends BrownEventEmitter<RemoteTerminalProce
     }
   }
 
-  async run(sessionId: string, command: string, cwd?: string, sshType?: string): Promise<void> {
+  async run(sessionId: string, command: string, cwd?: string, sshType?: string, assetType?: string): Promise<void> {
     this.sessionId = sessionId
     const resolvedType = sshType || 'ssh'
     this.sshType = resolvedType
     try {
+      if (isSwitchAssetType(assetType)) {
+        throw new Error('Network device assets must use the dedicated network-device runner')
+      }
       if (resolvedType === 'jumpserver') {
         await this.runJumpServerCommand(sessionId, command, cwd)
       } else if (resolvedType === 'ssh') {
@@ -1126,7 +1130,7 @@ export class RemoteTerminalManager {
       process.once('error', (error) => {
         reject(error)
       })
-      process.run(terminalInfo.sessionId, command, cwd, terminalInfo.connectionInfo.sshType).catch(reject)
+      process.run(terminalInfo.sessionId, command, cwd, terminalInfo.connectionInfo.sshType, terminalInfo.connectionInfo.asset_type).catch(reject)
     })
     const result = mergeRemotePromise(process, promise)
     return result

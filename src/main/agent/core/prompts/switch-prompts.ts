@@ -282,3 +282,64 @@ export function getSwitchPromptByAssetType(assetType: string | undefined, langua
   if (!brand) return null
   return getSwitchPrompt(brand, language)
 }
+
+export function getSwitchBrandFromAssetType(assetType: string | undefined): SwitchBrand | null {
+  return ASSET_TYPE_TO_BRAND[assetType as SwitchAssetType] ?? null
+}
+
+export function getSwitchDiscoveryCommand(brand: SwitchBrand): string {
+  return brand === 'cisco' ? 'show version' : 'display version'
+}
+
+export function getSwitchPagerDisableCommands(brand: SwitchBrand): string[] {
+  return brand === 'cisco' ? ['terminal length 0'] : ['screen-length 0 temporary']
+}
+
+const READ_ONLY_PREFIXES: Record<SwitchBrand, string[]> = {
+  cisco: ['show ', 'ping ', 'traceroute ', 'terminal length '],
+  huawei: ['display ', 'ping ', 'tracert ', 'screen-length ']
+}
+
+const CONFIGURATION_COMMANDS: Record<SwitchBrand, string[]> = {
+  cisco: [
+    'configure terminal',
+    'conf t',
+    'interface ',
+    'vlan ',
+    'switchport ',
+    'channel-group ',
+    'write memory',
+    'copy running-config startup-config'
+  ],
+  huawei: ['system-view', 'interface ', 'vlan ', 'port ', 'eth-trunk ', 'save', 'return']
+}
+
+const DESTRUCTIVE_COMMANDS: Record<SwitchBrand, string[]> = {
+  cisco: ['reload', 'erase startup-config', 'delete ', 'format ', 'shutdown'],
+  huawei: ['reboot', 'reset saved-configuration', 'delete ', 'format ', 'shutdown']
+}
+
+const INTERACTIVE_COMMANDS: Record<SwitchBrand, string[]> = {
+  cisco: ['copy ', 'reload', 'write erase'],
+  huawei: ['save', 'reboot', 'reset saved-configuration']
+}
+
+export function getSwitchSafetyClassification(brand: SwitchBrand, command: string): 'read-only' | 'configuration' | 'destructive' | 'interactive' {
+  const normalized = command.trim().toLowerCase()
+  if (!normalized) return 'read-only'
+
+  if (INTERACTIVE_COMMANDS[brand].some((prefix) => normalized.startsWith(prefix))) {
+    return 'interactive'
+  }
+  if (DESTRUCTIVE_COMMANDS[brand].some((prefix) => normalized.startsWith(prefix))) {
+    return 'destructive'
+  }
+  if (CONFIGURATION_COMMANDS[brand].some((prefix) => normalized.startsWith(prefix))) {
+    return 'configuration'
+  }
+  if (READ_ONLY_PREFIXES[brand].some((prefix) => normalized.startsWith(prefix))) {
+    return 'read-only'
+  }
+
+  return 'configuration'
+}

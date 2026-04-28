@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C /root/Chaterm status --short)",
+      "Bash(npm -v)",
+      "Bash(pnpm -v)",
+      "Bash(lsb_release -a)",
+      "Read(//usr/lib/**)",
+      "Bash(make --version)",
+      "Bash(g++ --version)"
+    ]
+  }
+}

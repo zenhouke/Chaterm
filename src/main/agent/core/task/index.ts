@@ -68,6 +68,8 @@ interface MessageUpdater {
 
 import { AssistantMessageContent, parseAssistantMessageV2, ToolParamName, ToolUseName, TextContent, ToolUse } from '@core/assistant-message'
 import { RemoteTerminalManager, ConnectionInfo, RemoteTerminalInfo, RemoteTerminalProcessResultPromise } from '../../integrations/remote-terminal'
+import { NetworkDeviceManager } from '../../integrations/network-device'
+import type { NetworkDeviceTerminalInfo, NetworkDeviceProcessPromise } from '../../integrations/network-device/types'
 import { LocalTerminalManager, LocalCommandProcess } from '../../integrations/local-terminal'
 import { getK8sAgentManager } from '../../integrations/k8s'
 import { createExperienceManager } from '../../services/experience'
@@ -76,6 +78,7 @@ import type { InteractionResult } from '../../services/interaction-detector/type
 import { getFormatResponse } from '@core/prompts/responses'
 import { addUserInstructions, SYSTEM_PROMPT, SYSTEM_PROMPT_CN } from '@core/prompts/system'
 import { getSwitchPromptByAssetType } from '@core/prompts/switch-prompts'
+import { getNetworkDeviceCapabilities } from '../../integrations/network-device/command-policy'
 import { SLASH_COMMANDS, getSummaryToDocPrompt, getSummaryToSkillPrompt } from '@core/prompts/slash-commands'
 import { CommandSecurityManager } from '../security/CommandSecurityManager'
 import { getContextWindowInfo } from '@core/context/context-management/context-window-utils'
@@ -236,6 +239,7 @@ export class Task {
   contextManager: ContextManager
   private responseFormatter: ReturnType<typeof getFormatResponse>
   private remoteTerminalManager: RemoteTerminalManager
+  private networkDeviceManager: NetworkDeviceManager
   private localTerminalManager: LocalTerminalManager
   customInstructions?: string
   autoApprovalSettings: AutoApprovalSettings
@@ -289,6 +293,7 @@ export class Task {
   private currentRunningProcess:
     | (LocalCommandProcess & { sendInput?: (input: string) => Promise<import('../../services/interaction-detector/types').SendInputResult> })
     | RemoteTerminalProcessResultPromise
+    | NetworkDeviceProcessPromise
     | null = null
 
   // streaming
@@ -534,6 +539,7 @@ export class Task {
     this.mcpHub = mcpHub
     this.skillsManager = skillsManager
     this.remoteTerminalManager = new RemoteTerminalManager()
+    this.networkDeviceManager = new NetworkDeviceManager()
     this.localTerminalManager = LocalTerminalManager.getInstance()
     this.contextManager = new ContextManager()
     this.responseFormatter = getFormatResponse(DEFAULT_LANGUAGE_SETTINGS)
@@ -1094,12 +1100,16 @@ export class Task {
     return message?.hostId === hostInfo.hostId
   }
 
+  private isNetworkDeviceHost(host?: Host): boolean {
+    return host?.assetType?.startsWith('person-switch-') ?? false
+  }
+
   private async connectTerminal(ip?: string) {
     if (!this.hosts) {
       logger.debug('Terminal UUID is not set', { event: 'agent.task.terminal.uuid.missing' })
       return
     }
-    let terminalInfo: RemoteTerminalInfo | null = null
+    let terminalInfo: RemoteTerminalInfo | NetworkDeviceTerminalInfo | null = null
     const targetHost = ip ? this.hosts.find((host) => host.host === ip) : this.hosts[0]
     if (!targetHost || !targetHost.uuid) {
       logger.debug('Terminal UUID is not set', { event: 'agent.task.terminal.uuid.missing' })
@@ -1138,7 +1148,15 @@ export class Task {
           })
         }
       }
-      this.remoteTerminalManager.setConnectionInfo(connectionInfo)
+      const isNetworkDevice = this.isNetworkDeviceHost(targetHost)
+      if (isNetworkDevice) {
+        this.networkDeviceManager.setConnectionInfo({
+          ...(connectionInfo as ConnectionInfo),
+          asset_type: targetHost.assetType
+        })
+      } else {
+        this.remoteTerminalManager.setConnectionInfo(connectionInfo)
+      }
 
       const hostLabel = connectionInfo?.host || targetHost.host || ip || 'unknown'
       // Create a unique connection identifier
@@ -1167,7 +1185,7 @@ export class Task {
         })
       }
 
-      terminalInfo = await this.remoteTerminalManager.createTerminal()
+      terminalInfo = isNetworkDevice ? await this.networkDeviceManager.createTerminal() : await this.remoteTerminalManager.createTerminal()
 
       if (terminalInfo && isNewConnection) {
         if (!shouldSkipConnectionMessages) {
@@ -1213,6 +1231,7 @@ export class Task {
   // Set remote connection information
   setRemoteConnectionInfo(connectionInfo: ConnectionInfo): void {
     this.remoteTerminalManager.setConnectionInfo(connectionInfo)
+    this.networkDeviceManager.setConnectionInfo(connectionInfo)
   }
 
   // Get terminal manager (public method)
@@ -1740,6 +1759,7 @@ export class Task {
   async abortTask() {
     this.abort = true // will stop any autonomously running promises
     this.remoteTerminalManager.disposeAll()
+    this.networkDeviceManager.disposeAll()
     // Clean up command contexts to prevent stale IPC references
     Task.clearCommandContextsForTask(this.taskId)
   }
@@ -1751,6 +1771,7 @@ export class Task {
     if (this.currentRunningProcess) {
       // Stop the current process but don't terminate the entire task
       this.remoteTerminalManager.disposeAll()
+      this.networkDeviceManager.disposeAll()
       // Clean up command contexts for this task
       Task.clearCommandContextsForTask(this.taskId)
     }
@@ -1953,6 +1974,8 @@ export class Task {
       return this.executeK8sCommandTool(command, ip)
     }
 
+    const targetHost = this.hosts?.find((host) => host.host === ip)
+    const isNetworkDevice = this.isNetworkDeviceHost(targetHost)
     let result = ''
     let chunkTimer: NodeJS.Timeout | null = null
 
@@ -1972,12 +1995,17 @@ export class Task {
       }
       terminalInfo.terminal.show()
       const userLocale = await this.getUserLocale()
-      const process = this.remoteTerminalManager.runCommand(terminalInfo, command, undefined, {
-        taskId: this.taskId,
-        enableInteraction: true,
-        llmCaller: this.createInteractionLlmCaller(),
-        userLocale
-      })
+      const process = isNetworkDevice
+        ? this.networkDeviceManager.runCommand(terminalInfo as NetworkDeviceTerminalInfo, command, undefined, {
+            taskId: this.taskId,
+            hostInfo
+          })
+        : this.remoteTerminalManager.runCommand(terminalInfo as RemoteTerminalInfo, command, undefined, {
+            taskId: this.taskId,
+            enableInteraction: true,
+            llmCaller: this.createInteractionLlmCaller(),
+            userLocale
+          })
 
       // Store the current running process so it can receive interactive input
       this.currentRunningProcess = process
@@ -2919,13 +2947,59 @@ export class Task {
           // In agent mode, continue executing subsequent logic
         }
 
+        const targetHost = this.hosts?.find((host) => host.host === ip)
+        const networkDeviceCapabilities = getNetworkDeviceCapabilities(targetHost?.assetType)
+        if (networkDeviceCapabilities) {
+          const commandPlan = this.networkDeviceManager.getCommandPlan(
+            {
+              id: 0,
+              sessionId: '',
+              busy: false,
+              lastCommand: '',
+              connectionInfo: {
+                host: targetHost?.host,
+                needProxy: false,
+                asset_type: targetHost?.assetType
+              },
+              terminal: { show: () => {} }
+            },
+            command
+          )
+          if (commandPlan.requiresApproval && !requiresApprovalPerLLM) {
+            logger.warn('Network device command policy escalated approval requirement', {
+              event: 'agent.task.network_device.approval.escalated',
+              host: targetHost?.host,
+              assetType: targetHost?.assetType,
+              command
+            })
+          }
+        }
+
         const autoApproveResult = this.shouldAutoApproveTool(block.name)
         let [autoApproveSafe, autoApproveAll] = Array.isArray(autoApproveResult) ? autoApproveResult : [autoApproveResult, false]
 
         // If security confirmation already passed, skip auto-approval logic
+        const effectiveRequiresApproval = networkDeviceCapabilities
+          ? this.networkDeviceManager.getCommandPlan(
+              {
+                id: 0,
+                sessionId: '',
+                busy: false,
+                lastCommand: '',
+                connectionInfo: {
+                  host: targetHost?.host,
+                  needProxy: false,
+                  asset_type: targetHost?.assetType
+                },
+                terminal: { show: () => {} }
+              },
+              command
+            ).requiresApproval || requiresApprovalPerLLM
+          : requiresApprovalPerLLM
+
         if (
           !needsSecurityApproval &&
-          ((!requiresApprovalPerLLM && autoApproveSafe) || (requiresApprovalPerLLM && autoApproveSafe && autoApproveAll))
+          ((!effectiveRequiresApproval && autoApproveSafe) || (effectiveRequiresApproval && autoApproveSafe && autoApproveAll))
         ) {
           // In auto-approval mode, commands without security risks execute directly
           this.removeLastPartialMessageIfExistsWithType('ask', 'command')
@@ -2938,7 +3012,7 @@ export class Task {
           // 2. Session setting: user clicked "auto-approve read-only" button in this session
           const latestAutoApprovalSettings = await getGlobalState('autoApprovalSettings')
           const globalAutoExecuteReadOnly = latestAutoApprovalSettings?.actions?.autoExecuteReadOnlyCommands ?? false
-          if (!requiresApprovalPerLLM && (globalAutoExecuteReadOnly || this.readOnlyCommandsAutoApproved)) {
+          if (!effectiveRequiresApproval && (globalAutoExecuteReadOnly || this.readOnlyCommandsAutoApproved)) {
             // Auto-approve read-only command
             const reason = globalAutoExecuteReadOnly ? 'global setting' : 'session auto-approval'
             logger.info(`[Command Execution] Auto-approving read-only command (${reason} enabled)`)
